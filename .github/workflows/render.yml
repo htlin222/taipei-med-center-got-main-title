@@ -1,0 +1,102 @@
+name: Render 1080p MP4
+
+on:
+  workflow_dispatch:
+    inputs:
+      shards:
+        description: Number of render shards (GitHub runs at most 20 jobs at once)
+        default: "20"
+      fps:
+        description: Frames per second
+        default: "30"
+  push:
+    paths:
+      - "site/**"
+      - "scripts/**"
+      - ".github/workflows/render.yml"
+
+concurrency:
+  group: render-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      frames: ${{ steps.plan.outputs.frames }}
+      fps: ${{ steps.plan.outputs.fps }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - id: plan
+        run: |
+          FPS=${{ github.event.inputs.fps || '30' }}
+          SHARDS=${{ github.event.inputs.shards || '20' }}
+          DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 site/music.mp3)
+          FRAMES=$(python3 -c "import math;print(math.ceil($DUR*$FPS))")
+          MATRIX=$(python3 - <<PY
+          import json
+          n,s=$FRAMES,$SHARDS
+          step=-(-n//s)
+          print(json.dumps({"include":[{"id":f"{i:03d}","from":a,"to":min(a+step,n)} for i,a in enumerate(range(0,n,step))]}))
+          PY
+          )
+          echo "frames=$FRAMES" >> "$GITHUB_OUTPUT"
+          echo "fps=$FPS" >> "$GITHUB_OUTPUT"
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "Duration $DUR s -> $FRAMES frames at $FPS fps in $SHARDS shards"
+
+  render:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    name: render ${{ matrix.id }} [${{ matrix.from }}-${{ matrix.to }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg fonts-noto-cjk
+      - run: npm install --no-audit --no-fund
+      - run: npx playwright install --with-deps chromium
+      - name: Serve site
+        run: |
+          python3 -m http.server 8765 --directory site > /dev/null 2>&1 &
+          for i in $(seq 1 30); do curl -sf http://localhost:8765/index.html > /dev/null && break; sleep 1; done
+      - name: Render frames ${{ matrix.from }}..${{ matrix.to }}
+        run: node scripts/render.cjs --from ${{ matrix.from }} --to ${{ matrix.to }} --fps ${{ needs.plan.outputs.fps }} --out seg_${{ matrix.id }}.mp4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seg_${{ matrix.id }}
+          path: seg_${{ matrix.id }}.mp4
+          retention-days: 3
+
+  combine:
+    needs: [plan, render]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: seg_*
+          path: segs
+          merge-multiple: true
+      - name: Concatenate shards and add the music
+        run: |
+          ls segs/seg_*.mp4 | sort | sed "s|^|file '$PWD/|; s|$|'|" > list.txt
+          cat list.txt
+          ffmpeg -y -loglevel error -f concat -safe 0 -i list.txt -c copy video.mp4
+          ffmpeg -y -loglevel error -i video.mp4 -i site/music.mp3 -map 0:v -map 1:a -c:v copy -c:a aac -b:a 320k -shortest -movflags +faststart taipei-medical-centers-1080p.mp4
+          ffprobe -v error -show_entries format=duration:stream=codec_name,width,height,nb_frames -of compact taipei-medical-centers-1080p.mp4
+          test "$(ffprobe -v error -count_packets -select_streams v -show_entries stream=nb_read_packets -of csv=p=0 video.mp4)" = "${{ needs.plan.outputs.frames }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: taipei-medical-centers-1080p
+          path: taipei-medical-centers-1080p.mp4
+          retention-days: 30

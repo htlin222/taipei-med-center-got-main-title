@@ -1,0 +1,11 @@
+{
+  "name": "taipei-med-center-got-main-title",
+  "private": true,
+  "scripts": {
+    "serve": "python3 -m http.server 8765 --directory site",
+    "render": "node scripts/render.cjs"
+  },
+  "dependencies": {
+    "playwright": "1.48.2"
+  }
+}
