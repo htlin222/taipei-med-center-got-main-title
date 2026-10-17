@@ -13,7 +13,9 @@ on:
     paths:
       - "site/**"
       - "scripts/**"
-      - ".github/workflows/render.yml"
+
+permissions:
+  contents: write
 
 concurrency:
   group: render-${{ github.ref }}
@@ -100,3 +102,20 @@ jobs:
           name: taipei-medical-centers-1080p
           path: taipei-medical-centers-1080p.mp4
           retention-days: 30
+      - name: Smaller copy for sharing
+        run: ffmpeg -y -loglevel error -i taipei-medical-centers-1080p.mp4 -c:v libx264 -preset faster -crf 22 -pix_fmt yuv420p -c:a copy -movflags +faststart taipei-medical-centers-1080p-share.mp4
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="render-$(date -u +%Y%m%d)-${{ github.run_number }}"
+          cat > notes.md <<EOF
+          1920×1080 · 30 fps · ${{ needs.plan.outputs.frames }} frames · H.264 + AAC 320k
+
+          - \`taipei-medical-centers-1080p.mp4\` — master (CRF 16)
+          - \`taipei-medical-centers-1080p-share.mp4\` — smaller copy for sharing (CRF 22)
+
+          Rendered from ${{ github.sha }} in parallel shards — [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
+          EOF
+          gh release create "$TAG" --target "${{ github.sha }}" --title "Main Title 1080p · $TAG" --notes-file notes.md \
+            taipei-medical-centers-1080p.mp4 taipei-medical-centers-1080p-share.mp4

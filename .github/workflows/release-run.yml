@@ -1,0 +1,51 @@
+name: Release a finished render
+
+# Publishes the MP4 of an already-finished render run as a GitHub Release,
+# without rendering again.
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: ID of a successful "Render 1080p MP4" run
+        required: true
+      tag:
+        description: Release tag
+        required: true
+  push:
+    paths:
+      - ".github/workflows/release-run.yml"
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      RUN_ID: ${{ github.event.inputs.run_id || '39036916047' }}
+      TAG: ${{ github.event.inputs.tag || 'v1.0.0' }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: taipei-medical-centers-1080p
+          run-id: ${{ env.RUN_ID }}
+          github-token: ${{ github.token }}
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - name: Smaller copy for sharing
+        run: ffmpeg -y -loglevel error -i taipei-medical-centers-1080p.mp4 -c:v libx264 -preset faster -crf 22 -pix_fmt yuv420p -c:a copy -movflags +faststart taipei-medical-centers-1080p-share.mp4
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<EOF
+          1920×1080 · 30 fps · 101.6 s · H.264 + AAC 320k
+
+          - \`taipei-medical-centers-1080p.mp4\` — master (CRF 16, ~90 Mbps)
+          - \`taipei-medical-centers-1080p-share.mp4\` — smaller copy for sharing (CRF 22)
+
+          Rendered on GitHub Actions in 20 parallel shards — [render run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${RUN_ID}).
+          EOF
+          gh release create "$TAG" -R "${{ github.repository }}" --target "${{ github.sha }}" \
+            --title "Taipei Medical Centers — Main Title (1080p)" --notes-file notes.md \
+            taipei-medical-centers-1080p.mp4 taipei-medical-centers-1080p-share.mp4

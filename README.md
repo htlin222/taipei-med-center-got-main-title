@@ -7,7 +7,9 @@ A *Game of Thrones*–style opening sequence over real 3D Taipei terrain: seven 
 - `.github/workflows/render.yml` — renders a **1920×1080 MP4** on GitHub Actions:
   1. **plan** reads the music length and splits the frames into N shards (default 20 — GitHub's limit on concurrent jobs),
   2. **render** runs every shard in parallel (matrix) and uploads `seg_XXX.mp4`,
-  3. **combine** concatenates the shards losslessly, muxes the music, and uploads `taipei-medical-centers-1080p.mp4` as a workflow artifact.
+  3. **combine** concatenates the shards losslessly, muxes the music, and publishes a **GitHub Release** (`render-YYYYMMDD-N`) with the master MP4 and a smaller share copy.
+
+`release-run.yml` publishes an already-finished render run as a release without re-rendering (inputs: run ID and tag).
 
 Run it from **Actions → Render 1080p MP4 → Run workflow** (shards and fps are inputs); it also runs on pushes that touch `site/` or the renderer.
 
