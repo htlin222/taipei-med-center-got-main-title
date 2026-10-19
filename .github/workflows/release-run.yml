@@ -33,7 +33,7 @@ jobs:
           github-token: ${{ github.token }}
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
       - name: Smaller copy for sharing
-        run: ffmpeg -y -loglevel error -i taipei-medical-centers-1080p.mp4 -c:v libx264 -preset faster -crf 22 -pix_fmt yuv420p -c:a copy -movflags +faststart taipei-medical-centers-1080p-share.mp4
+        run: ffmpeg -y -loglevel error -i taipei-medical-centers-1080p.mp4 -c:v libx264 -preset faster -crf 22 -pix_fmt yuv420p -an -movflags +faststart taipei-medical-centers-1080p-share.mp4
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

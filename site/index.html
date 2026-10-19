@@ -60,7 +60,7 @@ import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
-import { BokehPass } from 'three/addons/postprocessing/BokehPass.js';
+import { Pass, FullScreenQuad } from 'three/addons/postprocessing/Pass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
@@ -1437,14 +1437,40 @@ const key=new THREE.DirectionalLight(0xffd6a6,2.2);key.castShadow=true;key.shado
 Object.assign(key.shadow.camera,{left:-22,right:22,top:22,bottom:-22,near:1,far:200});key.shadow.bias=-.0005;key.shadow.normalBias=.03;scene.add(key,key.target);
 const rim=new THREE.DirectionalLight(0x6f8fb0,.75);scene.add(rim,rim.target);
 const siteLight=new THREE.PointLight(0xffa860,0,26,1.4);scene.add(siteLight);
-const composer=new EffectComposer(renderer);composer.addPass(new RenderPass(scene,camera));
+// Scene pass that keeps the REAL depth buffer of the beauty render (curved ground, rising buildings, alpha-cut
+// leaves all included), so depth of field focuses on exactly what is on screen.
+class ScenePass extends Pass{constructor(scene,camera){super();this.scene=scene;this.camera=camera;this.needsSwap=false;
+    this.depthTexture=new THREE.DepthTexture(4,4);this.depthTexture.type=THREE.UnsignedIntType;
+    this.rt=new THREE.WebGLRenderTarget(4,4,{type:THREE.HalfFloatType,depthTexture:this.depthTexture});
+    this.quad=new FullScreenQuad(new THREE.ShaderMaterial({uniforms:{tDiffuse:{value:null}},depthTest:false,depthWrite:false,
+      vertexShader:'varying vec2 vUv;void main(){vUv=uv;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);}',
+      fragmentShader:'uniform sampler2D tDiffuse;varying vec2 vUv;void main(){gl_FragColor=texture2D(tDiffuse,vUv);}'}));}
+  setSize(w,h){this.rt.setSize(w,h);}
+  render(renderer,writeBuffer,readBuffer){renderer.setRenderTarget(this.rt);renderer.clear();renderer.render(this.scene,this.camera);
+    this.quad.material.uniforms.tDiffuse.value=this.rt.texture;renderer.setRenderTarget(this.renderToScreen?null:readBuffer);this.quad.render(renderer);}}
+const composer=new EffectComposer(renderer);const scenePass=new ScenePass(scene,camera);composer.addPass(scenePass);
 const gtao=new GTAOPass(scene,camera,1280,720);gtao.output=GTAOPass.OUTPUT.Default;gtao.blendIntensity=1.0;
 gtao.updateGtaoMaterial({radius:.55,distanceExponent:1.4,thickness:1.2,scale:1.1,samples:16,distanceFallOff:1.0});
 gtao.updatePdMaterial({lumaPhi:10,depthPhi:2,normalPhi:3,radius:6,rings:2,samples:16});
 curved(gtao.normalMaterial,(sh)=>{sh.uniforms.uSeg=U.uSeg;sh.vertexShader=sh.vertexShader.replace('#include <common>','#include <common>\nattribute float aSeg;attribute float aDel;uniform float uSeg[8];').replace('#include <begin_vertex>','#include <begin_vertex>\n'+riseGLSL);});
 {const hid=[];gtao.overrideVisibility=()=>{hid.length=0;scene.traverse(o=>{if(o.visible&&(o.isPoints||o.isLine||o.isSprite||o.userData.noAO)){o.visible=false;hid.push(o);}});};gtao.restoreVisibility=()=>{for(const o of hid)o.visible=true;};}
 composer.addPass(gtao);
-const bokeh=new BokehPass(scene,camera,{focus:30,aperture:.0004,maxblur:.012});composer.addPass(bokeh);
+// Lens depth of field: thin-lens circle of confusion from true view depth, single-pass scatter-as-gather
+// (golden-angle spiral; background samples cannot bleed over a sharper foreground).
+const bokeh=new ShaderPass({uniforms:{tDiffuse:{value:null},tDepth:{value:scenePass.depthTexture},uNear:{value:camera.near},uFar:{value:camera.far},
+    uFocus:{value:30},uStr:{value:.4},uMaxPx:{value:12},uRes:{value:new THREE.Vector2(1280,720)}},
+  vertexShader:'varying vec2 vUv;void main(){vUv=uv;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);}',
+  fragmentShader:`#include <packing>
+    uniform sampler2D tDiffuse,tDepth;uniform float uNear,uFar,uFocus,uStr,uMaxPx;uniform vec2 uRes;varying vec2 vUv;
+    float vz(vec2 uv){return -perspectiveDepthToViewZ(texture2D(tDepth,uv).x,uNear,uFar);}
+    float coc(float z){return clamp(uStr*abs(1.-uFocus/max(z,1e-3)),0.,1.)*uMaxPx;}
+    void main(){vec2 px=1./uRes;float cz=vz(vUv);float cs=coc(cz);vec3 col=texture2D(tDiffuse,vUv).rgb;float tot=1.;
+      float r=.9,ang=0.;
+      for(int i=0;i<200;i++){if(r>=uMaxPx)break;vec2 tc=clamp(vUv+vec2(cos(ang),sin(ang))*px*r,px,1.-px);
+        vec3 sc=texture2D(tDiffuse,tc).rgb;float sz=vz(tc);float ss=coc(sz);if(sz>cz)ss=clamp(ss,0.,cs*2.);
+        float m=smoothstep(r-.5,r+.5,ss);col+=mix(col/tot,sc,m);tot+=1.;ang+=2.39996323;r+=.9/r;}
+      gl_FragColor=vec4(col/tot,1.);}`});
+composer.addPass(bokeh);
 composer.addPass(new ShaderPass({uniforms:{tDiffuse:{value:null}},vertexShader:'varying vec2 vUv;void main(){vUv=uv;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);}',fragmentShader:'uniform sampler2D tDiffuse;varying vec2 vUv;void main(){vec4 c=texture2D(tDiffuse,vUv);if(any(isnan(c))||any(isinf(c)))c=vec4(0.,0.,0.,1.);gl_FragColor=max(c,vec4(0.));}'}));
 const bloom=new UnrealBloomPass(new THREE.Vector2(1280,720),.32,.5,.93);composer.addPass(bloom);
 const grade=new ShaderPass({uniforms:{tDiffuse:{value:null},uTime:{value:0},uFade:{value:1}},
@@ -1549,30 +1575,62 @@ kf(4.2,SUN.clone().add(V(1.6,.9,5.2)),SUN.clone(),.3);
 kf(5.9,SUN.clone().add(V(3.4,1.2,9.0)),SUN.clone().add(V(0,-.6,0)),.4);
 kf(7.6,SUN.clone().add(V(7,2.2,13)),SUN.clone().add(V(0,-.6,0)),.5);
 kf(9.6,SUN.clone().add(V(10,-8,22)),SUN.clone().add(V(-3,-14,-8)),.55);
-{let prev=V(SUN.x,0,SUN.z);
- for(let i=0;i<7;i++){const P=HP[i],T0=SEG[i],L=SEG[i+1]-T0,din=DIRIN[i],dout=DIROUT[i],sg=SGN[i];const side=V(-din.z,0,din.x);
-  const dist=P.clone().sub(prev).setY(0).length();
-  if(dist>30){const m=prev.clone().lerp(P,.5);let mx=0;for(let s=0;s<=10;s++){const q=prev.clone().lerp(P,s/10);mx=Math.max(mx,gY(q.x,q.z));}kf(T0+1.3,V(m.x,mx+11+dist*.12,m.z).addScaledVector(side,2.5*sg),P.clone().add(V(0,1.5,0)),.45);}
-  kf(T0+3.0,P.clone().addScaledVector(din,-15).addScaledVector(side,2.5*sg).add(V(0,5.2,0)),P.clone().add(V(0,1.3,0)),.8);
-  const a0=Math.atan2(-din.z,-din.x);let a1=Math.atan2(-dout.z,-dout.x);let dA=a1-a0;while(dA*sg<0)dA+=sg*TAU;while(Math.abs(dA)>3.6)dA-=sg*TAU;dA=sg*clamp(Math.abs(dA),1.4,2.3);
-  const orb=(f,r,h)=>{const a=a0+dA*f;return P.clone().add(V(Math.cos(a)*r,h,Math.sin(a)*r));};
-  if(false){ // macro: skim past the Geneva drive & ring gear
-    const mp=sites[i].mechPt;const out=mp.clone().sub(P).setY(0).normalize();const tan=V(-out.z,0,out.x).multiplyScalar(sg);
-    kf(T0+5.3,mp.clone().addScaledVector(out,.95).addScaledVector(tan,-1.7).add(V(0,1.05,0)),mp.clone().addScaledVector(tan,.4).add(V(0,.2,0)),1.9);
-    kf(T0+6.9,mp.clone().addScaledVector(out,.2).addScaledVector(tan,1.9).add(V(0,2.4,0)),P.clone().add(V(0,1.8,0)),1.3);
-  }else{kf(T0+4.6,orb(.3,8.2,2.0),P.clone().add(V(0,1.3,0)),1.5);}
-  kf(T0+8.0,orb(.66,12.5,2.8),P.clone().add(V(0,2.9,0)),1.25);
-  kf(T0+9.3,orb(.88,13.5,4.6),P.clone().add(V(0,3.0,0)).addScaledVector(dout,1.5),1.0);
-  kf(T0+L+(i<6?.5:-.05),P.clone().addScaledVector(dout,-4).add(V(0,10.5,0)),P.clone().addScaledVector(dout,20),.5);
-  prev=P;}}
-kf(T_END+1.6,HP[6].clone().add(V(-6,22,26)),V(10,0,10),.3);kf(T_END+3.6,V(-2,46,96),V(-8,0,22),.25);kf(DUR,V(-2,52,112),V(-8,0,18),.2);
+// ---- flight plan -----------------------------------------------------------------------------------
+// Each centre: the camera glides in tangentially beside it, orbits at a constant angular rate in ONE
+// direction, and leaves tangentially already heading for the next centre. Between centres: a single
+// velocity-matched cubic (bell-shaped speed, no jolts) lifted by a smooth hump that clears the terrain.
+const TAU_D=1.5,TAU_A=2.3;                         // leave this long before a segment boundary, arrive this long after
+const wrapP=(x)=>{while(x>PI)x-=TAU;while(x<-PI)x+=TAU;return x;};
+const sm5=(x)=>{x=sat(x);return x*x*x*(x*(x*6-15)+10);};
+const ORB=[];
+for(let i=0;i<7;i++){const P=HP[i];const prev=i?HP[i-1]:V(SUN.x,0,SUN.z);const next=i<6?HP[i+1]:null;
+  const al=Math.atan2(P.z-prev.z,P.x-prev.x);                 // heading on arrival
+  const ph=next?Math.atan2(next.z-P.z,next.x-P.x):al+1.9;     // heading on departure
+  let best=null;for(const sg of [1,-1]){const OFF=1.0;const thS=al+PI+sg*OFF,thE=ph+PI+sg*OFF;let sw=((sg*(thE-thS))%TAU+TAU)%TAU;   // sweep in the direction of travel
+    const cost=sw<1.1?(1.1-sw)*3+.5:sw>3.4?(sw-3.4)*2:Math.abs(sw-2.1)*.3;if(!best||cost<best.cost)best={sg,thS,sw:Math.max(sw,sw<1.1?1.1:sw),cost};}
+  const tS=SEG[i]+TAU_A,tE=i<6?SEG[i+1]-TAU_D:T_END-.2;
+  ORB.push({P,sg:best.sg,thS:best.thS,d:best.sg*Math.min(best.sw,3.6),tS,tE});}
+function orbPose(o,t){const u=(t-o.tS)/(o.tE-o.tS);const e=sm5(u);const th=o.thS+o.d*u;
+  const R=lerp(11.5,14.0,e),hh=lerp(4.2,5.8,e);
+  return {p:o.P.clone().add(V(Math.cos(th)*R,hh,Math.sin(th)*R)),l:o.P.clone().add(V(0,lerp(1.9,3.0,e),0)),ap:1};}
+const vel=(f,t)=>f(t+.01).p.clone().sub(f(t-.01).p).multiplyScalar(50);
+function hermV(A,vA,B,vB,T,s){const s2=s*s,s3=s2*s;return A.clone().multiplyScalar(2*s3-3*s2+1).addScaledVector(vA,T*(s3-2*s2+s)).addScaledVector(B,-2*s3+3*s2).addScaledVector(vB,T*(s3-s2));}
+function mkTransit(f0,t0,f1,t1,o={}){const A=f0(t0),B=f1(t1),vA=vel(f0,t0),vB=vel(f1,t1),T=t1-t0;
+  const D=A.p.clone().sub(B.p).setY(0).length();let clr=0;          // hump: enough to clear every ridge on the way with margin
+  for(let k=4;k<=16;k++){const s=k/20;const q=hermV(A.p,vA,B.p,vB,T,s);const need=gY(q.x,q.z)+4+D*.04-q.y;clr=Math.max(clr,need/Math.max(Math.pow(Math.sin(PI*s),2),.35));}
+  const hump=Math.max(o.hump??(2.5+D*.09),clr);
+  const del0=(()=>{const dA=A.l.clone().sub(A.p),dB=o.fixedB?B.l.clone().sub(B.p):B.l.clone().sub(A.p);return wrapP(Math.atan2(dB.z,dB.x)-Math.atan2(dA.z,dA.x));})();
+  return (t)=>{const s=sat((t-t0)/T);const p=hermV(A.p,vA,B.p,vB,T,s);p.y+=hump*Math.pow(Math.sin(PI*s),2);
+    // gaze: interpolate heading/pitch ANGLES from "this centre" to "next centre", turning the same way throughout
+    const dA=A.l.clone().sub(p),dB=o.fixedB?B.l.clone().sub(B.p):B.l.clone().sub(p);const nA=dA.length(),nB=dB.length();
+    const yA=Math.atan2(dA.z,dA.x),yB=Math.atan2(dB.z,dB.x),pA=Math.atan2(dA.y,Math.hypot(dA.x,dA.z)),pB=Math.atan2(dB.y,Math.hypot(dB.x,dB.z));
+    const d=del0+wrapP(wrapP(yB-yA)-del0);
+    const k=sm5((s-(o.turn0??.0))/((o.turn1??.7)-(o.turn0??.0)));const yw=yA+d*k,pt=lerp(pA,pB,k),dist=lerp(nA,nB,k);
+    const dir=V(Math.cos(yw)*Math.cos(pt),Math.sin(pt),Math.sin(yw)*Math.cos(pt));
+    return {p,l:p.clone().addScaledVector(dir,dist),ap:lerp(lerp(A.ap,B.ap,s),.3,Math.sin(PI*s))};};}
+const PIECES=[];                                   // [t0,t1,f]
+{const introEnd=9.6;const introF=(t)=>camRaw(Math.min(t,introEnd));
+ const introD=(t)=>t<=introEnd?camRaw(t):(()=>{const c=camRaw(introEnd),v=vel(camRaw,introEnd-.011);return {p:c.p.clone().addScaledVector(v,t-introEnd),l:c.l,ap:c.ap};})();
+ PIECES.push([0,introEnd,introF]);
+ const o0=(t)=>orbPose(ORB[0],t);PIECES.push([introEnd,ORB[0].tS,mkTransit(introD,introEnd,o0,ORB[0].tS,{hump:2,lookAhead:.35})]);
+ for(let i=0;i<7;i++){const f=(t)=>orbPose(ORB[i],t);PIECES.push([ORB[i].tS,ORB[i].tE,f]);
+   if(i<6){const g=(t)=>orbPose(ORB[i+1],t);PIECES.push([ORB[i].tE,ORB[i+1].tS,mkTransit(f,ORB[i].tE,g,ORB[i+1].tS)]);}}
+ // outro: rise and pull back over the whole basin, settling to a near-stop under the title
+ // keep facing the way the last orbit faces: back away and rise, no about-face
+ const lastC=orbPose(ORB[6],ORB[6].tE);const fwd=lastC.l.clone().sub(lastC.p).setY(0).normalize();
+ const L2=V(-8,0,22),L3=L2.clone().addScaledVector(fwd,-4),tQ=T_END+3.6;
+ const Q2=L2.clone().addScaledVector(fwd,-74).setY(46),Q3=L2.clone().addScaledVector(fwd,-92).setY(52);
+ const outF=(t)=>{const s=sat((t-tQ)/(DUR-tQ));const e=1-Math.pow(1-s,2);return {p:Q2.clone().lerp(Q3,e),l:L2.clone().lerp(L3,e),ap:.22};};
+ const f6=(t)=>orbPose(ORB[6],t);PIECES.push([ORB[6].tE,tQ,mkTransit(f6,ORB[6].tE,outF,tQ,{hump:0,fixedB:true,turn0:.1,turn1:.85})]);PIECES.push([tQ,DUR+1,outF]);}
+function camPath(t){for(const [a,b,f] of PIECES)if(t<b)return f(Math.max(t,a));const L=PIECES[PIECES.length-1];return L[2](t);}
 function camRaw(t){let k=0;while(k<K.length-2&&K[k+1].t<=t)k++;const a=K[k],b=K[k+1];const h=b.t-a.t;const s=sat((t-a.t)/h);
   const a0=K[Math.max(k-1,0)],b1=K[Math.min(k+2,K.length-1)];
   const herm=(f)=>{const p0=f(a),p1=f(b);const m0=f(b).clone().sub(f(a0)).multiplyScalar(h/Math.max(b.t-a0.t,1e-3));const m1=f(b1).clone().sub(f(a)).multiplyScalar(h/Math.max(b1.t-a.t,1e-3));
     const s2=s*s,s3=s2*s;return p0.clone().multiplyScalar(2*s3-3*s2+1).add(m0.multiplyScalar(s3-2*s2+s)).add(p1.clone().multiplyScalar(-2*s3+3*s2)).add(m1.multiplyScalar(s3-s2));};
   return {p:herm(q=>q.p),l:herm(q=>q.l),ap:lerp(a.ap,b.ap,ease(s))};}
-const GW=[];{let s=0,s2=0;for(let k=-16;k<=16;k++){const w=Math.exp(-(k*k)/(2*3.6*3.6)),w2=Math.exp(-(k*k)/(2*7*7));GW.push([k*.075,w,w2]);s+=w;s2+=w2;}GW.forEach(g=>{g[1]/=s;g[2]/=s2;});}
-function camAt(t){const p=V(),l=V();let ap=0;for(const [dt,w,w2] of GW){const c=camRaw(clamp(t+dt,0,DUR));p.addScaledVector(c.p,w);l.addScaledVector(c.l,w2);ap+=c.ap*w;}return {p,l,ap};}
+// light temporal smoothing on top of an already C1 path (position σ≈.2 s, gaze σ≈.45 s)
+const GW=[];{let s=0,s2=0;for(let k=-14;k<=14;k++){const w=Math.exp(-(k*k)/(2*2.7*2.7)),w2=Math.exp(-(k*k)/(2*6*6));GW.push([k*.075,w,w2]);s+=w;s2+=w2;}GW.forEach(g=>{g[1]/=s;g[2]/=s2;});}
+function camAt(t){const p=V(),l=V();let ap=0;for(const [dt,w,w2] of GW){const c=camPath(clamp(t+dt,0,DUR));p.addScaledVector(c.p,w);l.addScaledVector(c.l,w2);ap+=c.ap*w;}return {p,l,ap};}
 
 // ================================================================ HUD
 const credit=$('credit'),meta=$('meta'),travel=$('travel'),titleEl=$('title');let hudSite=-1;
@@ -1582,7 +1640,7 @@ function setHud(i){if(hudSite===i)return;hudSite=i;const h=H7[i];
   meta.innerHTML=`${String(i+1).padStart(2,'0')} / 07<br><b>${h.lat.toFixed(4)}°N &nbsp;${h.lon.toFixed(4)}°E</b><br>ELEVATION ${Math.round(h.elev)} M`;}
 function hud(t){let si=-1;for(let i=0;i<7;i++)if(t>=SEG[i]&&t<SEG[i+1])si=i;
   if(si>=0){setHud(si);const T0=SEG[si],T1=SEG[si+1];const a=sat((t-(T0+3.1))/.6)*sat((T1-.9-t)/.6);credit.style.opacity=a;meta.style.opacity=a*.95;credit.style.transform=`translateY(${(1-a)*6}px)`;
-    if(si>0){const ta=sat((t-T0)/.3)*sat((T0+3.0-t)/.4);const km=H7[si-1].dn*easeIO(sat((t-T0+.05)/2.9));travel.style.opacity=ta;travel.innerHTML=`${SHORTN[si-1]} → ${SHORTN[si]}<b>${km.toFixed(2)} KM</b>`;}else travel.style.opacity=0;}
+    if(si>0){const ta=sat((t-T0)/.3)*sat((T0+3.0-t)/.4);const km=H7[si-1].dn*sm5((t-(T0-TAU_D))/(TAU_D+TAU_A));travel.style.opacity=ta;travel.innerHTML=`${SHORTN[si-1]} → ${SHORTN[si]}<b>${km.toFixed(2)} KM</b>`;}else travel.style.opacity=0;}
   else{credit.style.opacity=0;meta.style.opacity=0;travel.style.opacity=0;}
   const tt=sat((t-TITLE_IN)/1.2)*sat((FADE_OUT+.6-t)/1.0);titleEl.style.opacity=tt;titleEl.style.transform=`scale(${1+Math.max(0,t-TITLE_IN)*.006})`;titleEl.style.transformOrigin='50% 50%';}
 
@@ -1595,7 +1653,7 @@ function update(t){
   camera.position.copy(c.p);camera.lookAt(c.l);U.uBowl.value.set(c.l.x,c.l.z);
   if(window.__override){camera.position.copy(window.__override.P);camera.lookAt(window.__override.C);U.uBowl.value.set(window.__override.C.x,window.__override.C.z);}
   const dx=c.p.x-c.l.x,dz=c.p.z-c.l.z;camera.position.y+=U.uCurve.value*(dx*dx+dz*dz);camera.updateMatrixWorld();
-  const fd=camera.position.distanceTo(c.l);bokeh.enabled=dofOn;bokeh.uniforms.focus.value=fd;bokeh.uniforms.aperture.value=.00022*c.ap*(30/Math.max(fd,4));bokeh.uniforms.maxblur.value=.014;
+  const fd=camera.position.distanceTo(c.l);bokeh.enabled=dofOn;const BU=bokeh.uniforms;BU.uFocus.value=fd;BU.uStr.value=.38*c.ap*(1+4/Math.max(fd,1));BU.uNear.value=camera.near;BU.uFar.value=camera.far;
   scene.fog.density=lerp(.0042,.0016,sat((camera.position.y-14)/30));
   key.target.position.copy(c.l);key.position.copy(c.l).add(tmpV.set(-38,58,26));rim.target.position.copy(c.l);rim.position.copy(c.l).add(tmpV.set(30,20,-40));
   for(const m of facadeMats)m.emissiveIntensity=.05+e*.6+bp*.15;
@@ -1625,22 +1683,23 @@ function update(t){
 }
 
 // ================================================================ loop / audio / UI
-function resize(){const f=$('frame');const w=f.clientWidth,h=f.clientHeight;for(const m of (typeof VAPS!=='undefined'?VAPS:[]))m.uniforms.uScale.value=h*renderer.getPixelRatio()*.5/Math.tan(camera.fov*PI/360);renderer.setSize(w,h,false);composer.setSize(w,h);camera.aspect=w/h;camera.updateProjectionMatrix();}
+function resize(){const f=$('frame');const w=f.clientWidth,h=f.clientHeight;for(const m of (typeof VAPS!=='undefined'?VAPS:[]))m.uniforms.uScale.value=h*renderer.getPixelRatio()*.5/Math.tan(camera.fov*PI/360);renderer.setSize(w,h,false);composer.setSize(w,h);{const pr=renderer.getPixelRatio();bokeh.uniforms.uRes.value.set(w*pr,h*pr);bokeh.uniforms.uMaxPx.value=9*h*pr/720;}camera.aspect=w/h;camera.updateProjectionMatrix();}
 addEventListener('resize',resize);resize();
-const audio=new Audio('music.mp3');audio.preload='auto';
-let playing=false,tManual=parseFloat(Q.get('t')||'0');const T=()=>playing?audio.currentTime:tManual;
+// silent playback on a wall clock (no soundtrack is shipped); the cut still follows the beat map in audio.json
+let clock0=0;
+let playing=false,tManual=parseFloat(Q.get('t')||'0');const T=()=>playing?Math.min(DUR,(performance.now()-clock0)/1000):tManual;
 const wave=$('wave'),wx=wave.getContext('2d');
 function drawWave(t){const r=wave.getBoundingClientRect(),dpr=devicePixelRatio||1;if(wave.width!==Math.round(r.width*dpr)){wave.width=Math.round(r.width*dpr);wave.height=Math.round(r.height*dpr);}
   const w=wave.width,h=wave.height;wx.clearRect(0,0,w,h);const n=Math.floor(w/(3*dpr));
   for(let i=0;i<n;i++){const tt=i/n*DUR;const v=AUD.env[Math.floor(tt*30)]||0;const bh=Math.max(1.5*dpr,v*h*.8);wx.fillStyle=tt<=t?'#d8b06a':'#5a4a33';wx.fillRect(i*3*dpr,(h-bh)/2,2*dpr,bh);}
   wx.fillStyle='#a88b5a';wx.font=`${9*dpr}px Cinzel, serif`;for(let i=0;i<7;i++){const x=SEG[i]/DUR*w;wx.fillRect(x,0,dpr,h*.18);if(w>520*dpr)wx.fillText(SHORTN[i],x+3*dpr,9*dpr);}
   wx.fillStyle='#fff3d6';wx.fillRect(t/DUR*w,0,1.5*dpr,h);const s=Math.floor(t);$('tc').textContent=`${Math.floor(s/60)}:${String(s%60).padStart(2,'0')} / 1:41`;}
-function seek(t){t=clamp(t,0,DUR-.05);tManual=t;audio.currentTime=t;}
+function seek(t){t=clamp(t,0,DUR-.05);tManual=t;clock0=performance.now()-t*1000;}
 wave.addEventListener('pointerdown',e=>{const r=wave.getBoundingClientRect();seek((e.clientX-r.left)/r.width*DUR);});
-function setPlay(p){playing=p;if(p){audio.currentTime=tManual;audio.play().catch(()=>{playing=false;});}else{tManual=audio.currentTime;audio.pause();}$('pp').textContent=playing?'❚❚':'▶';}
+function setPlay(p){if(p){if(tManual>=DUR-.1)tManual=0;clock0=performance.now()-tManual*1000;}else if(playing){tManual=T();}playing=p;$('pp').textContent=playing?'❚❚':'▶';}
 $('pp').onclick=()=>{$('start').style.display='none';setPlay(!playing);};
 $('dofbtn').onclick=()=>{dofOn=!dofOn;$('dofbtn').textContent=dofOn?'DOF ON':'DOF OFF';};
-audio.addEventListener('ended',()=>{playing=false;tManual=DUR;$('pp').textContent='▶';});
+setInterval(()=>{if(playing&&T()>=DUR){playing=false;tManual=DUR;$('pp').textContent='▶';}},250);
 $('go').disabled=false;$('go').textContent='▶  PLAY';$('load').textContent='BEST WITH HEADPHONES, FULL SCREEN';
 $('go').onclick=()=>{$('start').style.display='none';seek(0);setPlay(true);try{$('stage').requestFullscreen?.();}catch(e){}};
 let hideT=0;const bar=$('bar');addEventListener('pointermove',()=>{bar.classList.remove('hide');hideT=performance.now();});
